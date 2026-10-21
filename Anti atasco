@@ -1,0 +1,122 @@
+-- =============================================================================
+-- CONFIGURACIÓN DE ANTI-ATASCO (Block Spin Independent)
+-- =============================================================================
+local AntiStuckConfig = {
+    Enabled = true,             -- Activa/Desactiva el sistema anti-atasco de velocidad
+    StuckVelocityThreshold = 2, -- Si la velocidad baja de este valor al acelerar, se considera atascado
+    UnstuckImpulseForce = 35,   -- Fuerza de la velocidad artificial inyectada para salir del atasco
+    CheckInterval = 0.35,       -- Cada cuánto tiempo se comprueba el estado del vehículo (en segundos)
+    MaxVelocityBypass = 250     -- Velocidad de crucero forzada cuando el sistema está empujando
+}
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local UserInputService = game:GetService("UserInputService")
+
+-- Variables de memoria física para traquear el atasco
+local lastVehiclePosition = Vector3.zero
+local stuckFramesCounter = 0
+
+-- Función optimizada para obtener el vehículo actual
+local function getDrivingVehicleModel()
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or not humanoid.Sit then return nil end
+    
+    local seat = humanoid.SeatPart
+    if not seat or not (seat:IsA("VehicleSeat") or seat:IsA("Seat")) then return nil end
+    
+    local vehiclesFolder = workspace:FindFirstChild("Vehicles") or workspace
+    local current = seat
+    while current and current ~= workspace do
+        if current.Parent == vehiclesFolder or current:FindFirstChild("Motors") then
+            return current
+        end
+        current = current.Parent
+    end
+    return seat:FindFirstAncestorOfClass("Model")
+end
+
+-- =============================================================================
+-- ALGORITMO ANTI-ATASCO Y MODIFICADOR VECTORIAL (Adaptación limpia del bloque 5068)
+-- =============================================================================
+local function verifyAndFixVehicleStuck()
+    if not AntiStuckConfig.Enabled then 
+        stuckFramesCounter = 0
+        return 
+    end
+
+    local carModel = getDrivingVehicleModel()
+    if not carModel then 
+        stuckFramesCounter = 0
+        return 
+    end
+
+    local primaryPart = carModel.PrimaryPart or carModel:FindFirstChildWhichIsA("BasePart")
+    if not primaryPart then return end
+
+    local currentPosition = primaryPart.Position
+    local currentVelocity = primaryPart.AssemblyLinearVelocity
+    
+    -- Detecta si el jugador está presionando activamente los controles de marcha (W o S)
+    local isAttemptingToMove = UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.S)
+
+    if isAttemptingToMove then
+        -- Mide la distancia real recorrida desde la última comprobación
+        local actualDistanceMoved = (currentPosition - lastVehiclePosition).Magnitude
+        local horizontalVelocity = Vector3.new(currentVelocity.X, 0, currentVelocity.Z).Magnitude
+
+        -- Si la velocidad física o el movimiento real caen por debajo del umbral tolerado...
+        if horizontalVelocity < AntiStuckConfig.StuckVelocityThreshold or actualDistanceMoved < 0.45 then
+            stuckFramesCounter = stuckFramesCounter + 1
+            
+            -- Si el atasco persiste durante más de 2 ciclos de escaneo, se fuerza el desatasco
+            if stuckFramesCounter >= 2 then
+                pcall(function()
+                    local pivot = carModel:GetPivot()
+                    -- Determina la dirección del impulso (hacia adelante si presiona W, hacia atrás si es S)
+                    local driveDirection = pivot.LookVector
+                    if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+                        driveDirection = -driveDirection
+                    end
+                    
+                    -- 1. BYPASS DE VELOCIDAD LINEAL: Rompe la fricción de las colisiones del mapa
+                    local impulseVector = driveDirection.Unit * AntiStuckConfig.UnstuckImpulseForce
+                    primaryPart.AssemblyLinearVelocity = Vector3.new(impulseVector.X, primaryPart.AssemblyLinearVelocity.Y + 5, impulseVector.Z)
+                    
+                    -- 2. RESET ANGULAR: Anula fuerzas de giro descontroladas que congelan las ruedas
+                    primaryPart.AssemblyAngularVelocity = Vector3.zero
+                    
+                    -- 3. EMPUJE CFRAME ARTIFICIAL: Teletransporta sutilmente el chasis fuera de la geometría
+                    carModel:TranslateBy(driveDirection.Unit * 1.5)
+                    
+                    -- 4. MODIFICADOR DINÁMICO DE MOTOR: Sobrescribe el torque nativo temporalmente
+                    local seat = carModel:FindFirstChildWhichIsA("VehicleSeat", true)
+                    if seat then
+                        seat.MaxSpeed = AntiStuckConfig.MaxVelocityBypass
+                    end
+                end)
+            end
+        else
+            -- Si el coche se mueve fluidamente, resetea el contador de frames bloqueados
+            stuckFramesCounter = 0
+        end
+    else
+        stuckFramesCounter = 0
+    end
+
+    -- Guarda la posición actual para la comparativa del siguiente ciclo
+    lastVehiclePosition = currentPosition
+end
+
+-- =============================================================================
+-- LOOP DE INYECCIÓN DE SEGURIDAD
+-- =============================================================================
+task.spawn(function()
+    while true do
+        pcall(verifyAndFixVehicleStuck)
+        task.wait(AntiStuckConfig.CheckInterval or 0.35)
+    end
+end)
+
+print("[Block Spin] Sistema Anti-Atasco Vectorial operativo.")
